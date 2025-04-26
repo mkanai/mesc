@@ -3,6 +3,7 @@ Compute expression scores and estimate expression cis-heritability from eQTL sum
 """
 
 from __future__ import division
+import gzip
 import numpy as np
 import pandas as pd
 import parse as ps
@@ -20,6 +21,16 @@ def sub_chr(s, chr):
     return s.replace("@", str(chr))
 
 
+def open_file(filename):
+    """
+    Open a file with gzip if it is gzipped
+    """
+    if filename.endswith(".gz"):
+        return gzip.open(filename, "rt")
+    else:
+        return open(filename, "r")
+
+
 def check_order_and_get_len(cismat, columns):
     """
     Check that genes and chromosome are sorted
@@ -28,7 +39,7 @@ def check_order_and_get_len(cismat, columns):
     each_chrom = np.zeros(22, dtype=int)
     chr = set()
     genes = set()
-    with open(cismat) as f:
+    with open_file(cismat) as f:
         for i, l in enumerate(f):
             l = l.split()
             if i == 0:
@@ -188,7 +199,7 @@ def get_expression_scores(args):
 
     keep_snps = pd.read_csv(args.keep, header=None)
 
-    with open(cismat) as f:
+    with open_file(cismat) as f:
         for i, line in enumerate(f):
             line = line.split()
             if i == 0:
@@ -377,7 +388,7 @@ def get_expression_scores(args):
                 np.savetxt(
                     "{}.{}.ave_h2cis".format(args.out, prev_chr),
                     np.array(ave_cis_herit).reshape((1, len(ave_cis_herit))),
-                    fmt="%.5f",
+                    fmt="%.5g",
                 )
 
                 expscore = pd.concat([pd.DataFrame(snps.values), pd.DataFrame(eqtl_annot)], axis=1)
@@ -388,10 +399,10 @@ def get_expression_scores(args):
                     sep="\t",
                     index=False,
                     compression="gzip",
-                    float_format="%.5f",
+                    float_format="%.5g",
                 )
 
-                all_herit.to_csv("{}.{}.hsq".format(args.out, prev_chr), sep="\t", index=False, float_format="%.5f")
+                all_herit.to_csv("{}.{}.hsq".format(args.out, prev_chr), sep="\t", index=False, float_format="%.5g")
                 print("Done chromosome {}".format(prev_chr))
 
                 if i == n_lines:
