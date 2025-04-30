@@ -82,7 +82,7 @@ def get_snp_list(cismat, keep, keep_chr, columns):
     print("Getting SNP list")
     snp_list = []
     snp_only = set()
-    with open(cismat) as f:
+    with open_file(cismat) as f:
         for j, line in enumerate(f):
             if j == 0:
                 continue
