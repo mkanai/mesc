@@ -198,7 +198,13 @@ def get_expression_scores(args):
     # making temporary keep snps file (merging args.keep w/ geno_bfile .bim)
     keep_snps = pd.read_csv(args.keep, header=None)
     keep_snps_geno = pd.read_csv(args.geno_bfile + '.bim', header=None, delim_whitespace=True)
-    keep_snps = keep_snps[keep_snps[0].isin(keep_snps_geno[1])]
+    
+    # Use pandas merge for better performance with large datasets
+    keep_df = pd.DataFrame({'SNP': keep_snps[0]})
+    geno_df = pd.DataFrame({'SNP': keep_snps_geno[1]})
+    merged = keep_df.merge(geno_df, on='SNP', how='inner')
+    keep_snps = pd.DataFrame({0: merged['SNP']})
+    
     keep_snps.to_csv('{}/keep_snps_chr_{}.txt'.format(args.tmp, args.chr), header=False, index=False)
 
     print('Analyzing chromosome {}'.format(args.chr))

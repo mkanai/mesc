@@ -123,7 +123,7 @@ parser.add_argument('--geno-bfile', default=None, type=str,
 # Optional flags
 parser.add_argument('--covariates', default=None, type=str,
                     help='Optional gene expression covariates (in PLINK format)')
-parser.add_argument('--gcta-path', default=os.path.join(dirname, 'gcta_nr_robust'), type=str,
+parser.add_argument('--gcta-path', default=os.path.join(dirname, 'gcta_nr_robust.patched'), type=str,
                     help='Path to GCTA')
 parser.add_argument('--tmp', default=os.path.join(dirname, 'tmp'), type=str,
                     help='Directory to store temporary files')
