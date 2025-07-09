@@ -133,6 +133,10 @@ parser.add_argument('--keep', default=os.path.join(dirname, 'data/hm3_snps.txt')
 parser.add_argument('--est-lasso-only', default=False, action='store_true',
                     help='Skip expression score estimation (only estimate eQTL effect sizes using LASSO and '
                          'h2cis using REML)')
+parser.add_argument('--ld-wind', default=1.0, type=float,
+                    help='LD window size in cM for computing LD scores. Default 1.0 cM.')
+parser.add_argument('--gene-list', default=None, type=str,
+                    help='File containing gene IDs to process (one per line). Useful for distributed processing.')
 
 # Compute expression scores from summary statistics
 # Required flags
@@ -150,6 +154,14 @@ parser.add_argument('--num-bins', default=5, type=int,
                     help='Number of overall expression cis-heritability bins. Default 5.')
 parser.add_argument('--num-gene-bins', default=3, type=int,
                     help='Number of expression cis-heritability bins per gene set. Default 3.')
+
+# Compute expression scores from pre-computed LASSO results
+parser.add_argument('--compute-expscore-from-lasso', default=False, action='store_true',
+                    help='Compute expression scores from pre-computed LASSO results (e.g., from distributed runs)')
+parser.add_argument('--lasso-files', default=None, type=str, nargs='+',
+                    help='LASSO result files (.lasso) from chunks. Can specify multiple files.')
+parser.add_argument('--hsq-files', default=None, type=str, nargs='+',
+                    help='Heritability result files (.hsq) from chunks. Can specify multiple files.')
 
 # Estimate mediated heritability
 # Required flags
@@ -219,8 +231,8 @@ if __name__ == '__main__':
         if not args.out:
             raise ValueError('Must specify --out')
 
-        if args.compute_expscore_indiv and args.compute_expscore_sumstat:
-            raise ValueError('Cannot set both --compute-expscore-indiv and --compute-expscore-sumstat')
+        if sum([args.compute_expscore_indiv, args.compute_expscore_sumstat, args.compute_expscore_from_lasso]) > 1:
+            raise ValueError('Cannot set multiple --compute-expscore-* options simultaneously')
 
         if args.compute_expscore_indiv:
             if args.plink_path is None:
@@ -242,6 +254,18 @@ if __name__ == '__main__':
             if not args.ref_ld_chr:
                 args.ref_ld_chr = os.path.join(dirname, 'data/1000G_Phase3_weights_hm3_no_MHC/weights.hm3_noMHC.')
             ss.get_expression_scores(args)
+        
+        elif args.compute_expscore_from_lasso:
+            if not args.lasso_files:
+                raise ValueError('Must specify --lasso-files with --compute-expscore-from-lasso')
+            if not args.hsq_files:
+                raise ValueError('Must specify --hsq-files with --compute-expscore-from-lasso')
+            if not args.geno_bfile:
+                raise ValueError('Must specify --geno-bfile with --compute-expscore-from-lasso')
+            if not args.chr:
+                raise ValueError('Must specify --chr with --compute-expscore-from-lasso')
+            subprocess.call(['mkdir', '-p', args.tmp])
+            ind.compute_expression_scores_from_lasso(args)
 
         # summary statistics
         elif args.h2med:

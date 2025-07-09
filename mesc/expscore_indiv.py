@@ -208,6 +208,19 @@ def get_expression_scores(args):
     keep_snps.to_csv('{}/keep_snps_chr_{}.txt'.format(args.tmp, args.chr), header=False, index=False)
 
     print('Analyzing chromosome {}'.format(args.chr))
+    
+    # Load gene list filter if provided
+    gene_filter = None
+    filtered_gene_count = n_genes  # Default to all genes
+    if hasattr(args, 'gene_list') and args.gene_list:
+        print('Loading gene list from {}'.format(args.gene_list))
+        gene_filter = set()
+        with open(args.gene_list, 'r') as f:
+            for line in f:
+                gene_filter.add(line.strip())
+        print('Filtering to {} genes from gene list'.format(len(gene_filter)))
+        filtered_gene_count = len(gene_filter)  # Use filtered count for display
+    
     all_lasso = []
     all_herit = []
     glist = []
@@ -250,8 +263,12 @@ def get_expression_scores(args):
             end_bp = int(line[columns[2]]) + 5e5
             phenos = line[columns[3]:]
 
+            # Skip if gene is not in filter list
+            if gene_filter is not None and gene not in gene_filter:
+                continue
+                
             gene_num += 1
-            print('Estimating eQTL effect sizes for gene {} of {}: {}'.format(gene_num, n_genes, gene))
+            print('Estimating eQTL effect sizes for gene {} of {}: {}'.format(gene_num, filtered_gene_count, gene))
             if gene in glist:
                 print('Skipping; duplicate gene')
                 continue
@@ -343,4 +360,200 @@ def get_expression_scores(args):
 
     print('Done chromosome {}'.format(args.chr))
     print('All done!')
+
+
+def compute_expression_scores_from_lasso(args):
+    '''
+    Compute expression scores from pre-computed LASSO results
+    This allows distributed computation where LASSO estimation is done in chunks
+    and then expression scores are computed from the merged results
+    
+    Parameters:
+    args: argparse object with:
+        - lasso_files: List of LASSO result files from chunks
+        - hsq_files: List of heritability result files from chunks
+        - geno_bfile: Genotype file for computing LD scores
+        - chr: Chromosome number
+        - out: Output prefix
+        - num_bins: Number of heritability bins (default 5)
+        - keep: SNP list file
+    
+    Outputs:
+        - {out}.{chr}.hsq: Merged heritability estimates
+        - {out}.{chr}.lasso: Merged LASSO effects
+        - {out}.{chr}.gannot.gz: Gene annotations
+        - {out}.{chr}.G: Gene counts per bin
+        - {out}.{chr}.ave_h2cis: Average heritability per bin
+        - {out}.{chr}.expscore.gz: Expression scores
+    '''
+    print('Computing expression scores from pre-computed LASSO results')
+    print('Reading {} LASSO files and {} heritability files'.format(
+        len(args.lasso_files), len(args.hsq_files)))
+    
+    # Read and merge LASSO results
+    lasso_dfs = []
+    for lasso_file in args.lasso_files:
+        print('Reading LASSO file: {}'.format(lasso_file))
+        df = pd.read_csv(lasso_file, sep='\t')
+        lasso_dfs.append(df)
+    
+    lasso_df = pd.concat(lasso_dfs, ignore_index=True)
+    print('Merged {} LASSO effects from {} genes'.format(len(lasso_df), lasso_df['GENE'].nunique()))
+    
+    # Read and merge heritability results
+    hsq_dfs = []
+    for hsq_file in args.hsq_files:
+        print('Reading heritability file: {}'.format(hsq_file))
+        df = pd.read_csv(hsq_file, sep='\t')
+        hsq_dfs.append(df)
+    
+    all_herit = pd.concat(hsq_dfs, ignore_index=True)
+    print('Merged heritability estimates for {} genes'.format(len(all_herit)))
+    
+    # Output merged heritability estimates
+    all_herit.to_csv('{}.{}.hsq'.format(args.out, args.chr), sep='\t', index=False, float_format='%.5f', na_rep='NA')
+    print('Saved merged heritability estimates to {}.{}.hsq'.format(args.out, args.chr))
+    
+    # Load genotype data for LD score computation
+    print('Loading genotype data from {}'.format(args.geno_bfile))
+    array_indivs = ps.PlinkFAMFile(args.geno_bfile + '.fam')
+    array_snps = ps.PlinkBIMFile(args.geno_bfile + '.bim')
+    
+    # Filter SNPs using the standard keep file (same as original implementation)
+    keep_file = args.keep if hasattr(args, 'keep') else os.path.join(os.path.dirname(__file__), '../data/hm3_snps.txt')
+    print('Using SNP list from: {}'.format(keep_file))
+    keep_snps = pd.read_csv(keep_file, header=None, delim_whitespace=True)
+    keep_snps.columns = ['SNP']
+    
+    # Get SNP indices
+    keep_snps_indices = np.where(
+        (array_snps.df['CHR'] == args.chr).values & 
+        array_snps.df['SNP'].isin(keep_snps['SNP']).values
+    )[0]
+    
+    print('Using {} SNPs on chromosome {}'.format(len(keep_snps_indices), args.chr))
+    
+    # Load genotype array with suppressed output
+    with Suppressor():
+        geno_array = ld.PlinkBEDFile(args.geno_bfile + '.bed', array_indivs.n, array_snps,
+                                     keep_snps=keep_snps_indices)
+    
+    # SNP indices as dict for fast merging
+    snp_indices = dict(zip(geno_array.df[:, 1].tolist(), range(len(geno_array.df))))
+    
+    # Prepare data structure similar to original all_lasso
+    # Structure: [(gene, h2cis, lasso_df_with_CORR_EFFECT), ...]
+    all_lasso_temp = []
+    
+    for gene in lasso_df['GENE'].unique():
+        # Get h2cis from heritability file
+        gene_herit = all_herit[all_herit['Gene'] == gene]
+        if len(gene_herit) == 0:
+            continue
+        
+        h2cis = gene_herit['h2cis'].values[0]
+        
+        # Skip genes with NaN or negative h2cis (matching original)
+        if np.isnan(h2cis) or h2cis <= 0:
+            continue
+        
+        # Get LASSO effects for this gene
+        gene_lasso = lasso_df[lasso_df['GENE'] == gene].copy()
+        if len(gene_lasso) == 0:
+            continue
+        
+        # Calculate empirical heritability and bias correction
+        lasso_weights = gene_lasso['EFFECT'].values
+        emp_herit = np.sum(np.square(lasso_weights))
+        
+        if emp_herit <= 0:
+            bias = 0
+        else:
+            bias = np.sqrt(h2cis / emp_herit)
+        
+        # Add CORR_EFFECT column (bias-corrected effects)
+        gene_lasso['CORR_EFFECT'] = lasso_weights * bias
+        
+        # Add to list in same format as original
+        all_lasso_temp.append((gene, h2cis, gene_lasso))
+    
+    print('{} genes passed filters (positive h2cis with LASSO effects)'.format(len(all_lasso_temp)))
+    
+    if len(all_lasso_temp) == 0:
+        raise ValueError('No genes with positive heritability found')
+    
+    # Output merged LASSO estimates (format matching original output)
+    # Extract just the GENE, CHR, SNP, EFFECT columns
+    lasso_output = lasso_df[['GENE', 'CHR', 'SNP', 'EFFECT']]
+    lasso_output.to_csv('{}.{}.lasso'.format(args.out, args.chr), sep='\t', index=False, float_format='%.8f', na_rep='NA')
+    print('Saved merged LASSO estimates to {}.{}.lasso'.format(args.out, args.chr))
+    
+    # Extract LASSO heritabilities for binning (use h2cis from REML, not empirical)
+    lasso_herits = [x[1] for x in all_lasso_temp]
+    
+    # Create gene annotation and eQTL annotation matrices
+    g_annot = np.zeros((len(all_lasso_temp), args.num_bins), dtype=int)
+    eqtl_annot = np.zeros((len(geno_array.df), args.num_bins))
+    
+    # Bin genes by REML h2cis
+    gene_bins = pd.qcut(np.array(lasso_herits), args.num_bins, labels=range(args.num_bins)).astype(int)
+    g_bin_names = ['Cis_herit_bin_{}'.format(x) for x in range(1, args.num_bins+1)]
+    
+    # Fill annotation matrices
+    for j in range(len(all_lasso_temp)):
+        gene, h2cis, gene_lasso = all_lasso_temp[j]
+        
+        # Gene annotation
+        g_annot[j, gene_bins[j]] = 1
+        
+        # eQTL annotation - use CORR_EFFECT squared
+        snp_idx = [snp_indices[x] for x in gene_lasso['SNP'].tolist()]
+        eqtl_annot[snp_idx, gene_bins[j]] += np.square(gene_lasso['CORR_EFFECT'].values)
+    
+    # Create gene annotation output
+    g_annot_final = pd.DataFrame(np.c_[[x[0] for x in all_lasso_temp], g_annot])
+    g_annot_final.columns = ['Gene'] + g_bin_names
+    g_annot_final.to_csv('{}.{}.gannot.gz'.format(args.out, args.chr), sep='\t', index=False, compression='gzip')
+    print('Saved gene annotations to {}.{}.gannot.gz'.format(args.out, args.chr))
+    
+    # Calculate average heritability per bin (using REML h2cis)
+    matched_herit = all_herit.loc[all_herit['Gene'].isin(g_annot_final['Gene']), 'h2cis'].values
+    G = np.sum(g_annot, axis=0)
+    ave_cis_herit = np.dot(matched_herit, g_annot) / G
+    
+    # Save gene counts and average heritabilities
+    np.savetxt('{}.{}.G'.format(args.out, args.chr), G.reshape((1, len(G))), fmt='%d')
+    np.savetxt('{}.{}.ave_h2cis'.format(args.out, args.chr), ave_cis_herit.reshape((1, len(ave_cis_herit))),
+               fmt="%.5f")
+    print('Saved gene counts to {}.{}.G'.format(args.out, args.chr))
+    print('Saved average heritabilities to {}.{}.ave_h2cis'.format(args.out, args.chr))
+    
+    # Compute expression scores using LD score regression
+    print('Computing expression scores...')
+    
+    # Get coordinates for LD window
+    block_left = ld.getBlockLefts(geno_array.df[:, 2], 1e6)
+    
+    # Estimate expression scores using built-in method
+    res = geno_array.ldScoreVarBlocks(block_left, c=50, annot=eqtl_annot)
+    
+    # Create output dataframe
+    expscore = pd.concat([
+        pd.DataFrame(geno_array.df[:, :3]),
+        pd.DataFrame(res)], axis=1)
+    expscore.columns = geno_array.colnames[:3] + g_bin_names
+    
+    # Save expression scores
+    expscore.to_csv('{}.{}.expscore.gz'.format(args.out, args.chr), sep='\t', index=False, 
+                    compression='gzip', float_format='%.5f')
+    print('Saved expression scores to {}.{}.expscore.gz'.format(args.out, args.chr))
+    
+    print('Expression score computation from LASSO files completed!')
+    print('Output files:')
+    print('  - {}.{}.hsq (merged heritability estimates)'.format(args.out, args.chr))
+    print('  - {}.{}.lasso (merged LASSO effects)'.format(args.out, args.chr))
+    print('  - {}.{}.gannot.gz (gene annotations)'.format(args.out, args.chr))
+    print('  - {}.{}.G (gene counts per bin)'.format(args.out, args.chr))
+    print('  - {}.{}.ave_h2cis (average heritability per bin)'.format(args.out, args.chr))
+    print('  - {}.{}.expscore.gz (expression scores)'.format(args.out, args.chr))
 
