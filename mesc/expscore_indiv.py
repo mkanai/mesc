@@ -410,9 +410,12 @@ def compute_expression_scores_from_lasso(args):
     all_herit = pd.concat(hsq_dfs, ignore_index=True)
     print('Merged heritability estimates for {} genes'.format(len(all_herit)))
     
-    # Output merged heritability estimates
+    # Output merged heritability estimates (early to free memory)
     all_herit.to_csv('{}.{}.hsq'.format(args.out, args.chr), sep='\t', index=False, float_format='%.5f', na_rep='NA')
     print('Saved merged heritability estimates to {}.{}.hsq'.format(args.out, args.chr))
+    
+    # OPTIMIZATION: Create heritability dict for O(1) lookups
+    herit_dict = all_herit.set_index('Gene')['h2cis'].to_dict()
     
     # Load genotype data for LD score computation
     print('Loading genotype data from {}'.format(args.geno_bfile))
@@ -441,29 +444,31 @@ def compute_expression_scores_from_lasso(args):
     # SNP indices as dict for fast merging
     snp_indices = dict(zip(geno_array.df[:, 1].tolist(), range(len(geno_array.df))))
     
+    # OPTIMIZATION: Output merged LASSO estimates early to free memory
+    lasso_output = lasso_df[['GENE', 'CHR', 'SNP', 'EFFECT']]
+    lasso_output.to_csv('{}.{}.lasso'.format(args.out, args.chr), sep='\t', index=False, float_format='%.8f', na_rep='NA')
+    print('Saved merged LASSO estimates to {}.{}.lasso'.format(args.out, args.chr))
+    
+    # OPTIMIZATION: Group LASSO effects by gene for efficient processing
+    lasso_grouped = lasso_df.groupby('GENE')
+    
     # Prepare data structure similar to original all_lasso
     # Structure: [(gene, h2cis, lasso_df_with_CORR_EFFECT), ...]
     all_lasso_temp = []
     
-    for gene in lasso_df['GENE'].unique():
-        # Get h2cis from heritability file
-        gene_herit = all_herit[all_herit['Gene'] == gene]
-        if len(gene_herit) == 0:
+    for gene, gene_lasso_group in lasso_grouped:
+        # OPTIMIZATION: Fast O(1) lookup from dict
+        if gene not in herit_dict:
             continue
         
-        h2cis = gene_herit['h2cis'].values[0]
+        h2cis = herit_dict[gene]
         
         # Skip genes with NaN or negative h2cis (matching original)
         if np.isnan(h2cis) or h2cis <= 0:
             continue
         
-        # Get LASSO effects for this gene
-        gene_lasso = lasso_df[lasso_df['GENE'] == gene].copy()
-        if len(gene_lasso) == 0:
-            continue
-        
-        # Calculate empirical heritability and bias correction
-        lasso_weights = gene_lasso['EFFECT'].values
+        # Work with grouped data directly
+        lasso_weights = gene_lasso_group['EFFECT'].values
         emp_herit = np.sum(np.square(lasso_weights))
         
         if emp_herit <= 0:
@@ -471,22 +476,16 @@ def compute_expression_scores_from_lasso(args):
         else:
             bias = np.sqrt(h2cis / emp_herit)
         
-        # Add CORR_EFFECT column (bias-corrected effects)
-        gene_lasso['CORR_EFFECT'] = lasso_weights * bias
+        # OPTIMIZATION: Use assign to avoid copy when possible
+        gene_lasso_with_corr = gene_lasso_group.assign(CORR_EFFECT=lasso_weights * bias)
         
         # Add to list in same format as original
-        all_lasso_temp.append((gene, h2cis, gene_lasso))
+        all_lasso_temp.append((gene, h2cis, gene_lasso_with_corr))
     
     print('{} genes passed filters (positive h2cis with LASSO effects)'.format(len(all_lasso_temp)))
     
     if len(all_lasso_temp) == 0:
         raise ValueError('No genes with positive heritability found')
-    
-    # Output merged LASSO estimates (format matching original output)
-    # Extract just the GENE, CHR, SNP, EFFECT columns
-    lasso_output = lasso_df[['GENE', 'CHR', 'SNP', 'EFFECT']]
-    lasso_output.to_csv('{}.{}.lasso'.format(args.out, args.chr), sep='\t', index=False, float_format='%.8f', na_rep='NA')
-    print('Saved merged LASSO estimates to {}.{}.lasso'.format(args.out, args.chr))
     
     # Extract LASSO heritabilities for binning (use h2cis from REML, not empirical)
     lasso_herits = [x[1] for x in all_lasso_temp]
@@ -507,6 +506,8 @@ def compute_expression_scores_from_lasso(args):
         g_annot[j, gene_bins[j]] = 1
         
         # eQTL annotation - use CORR_EFFECT squared
+        # Note: This assumes all SNPs in LASSO output exist in the genotype file
+        # which should be true since LASSO was run with --extract keep_snps
         snp_idx = [snp_indices[x] for x in gene_lasso['SNP'].tolist()]
         eqtl_annot[snp_idx, gene_bins[j]] += np.square(gene_lasso['CORR_EFFECT'].values)
     
@@ -517,7 +518,9 @@ def compute_expression_scores_from_lasso(args):
     print('Saved gene annotations to {}.{}.gannot.gz'.format(args.out, args.chr))
     
     # Calculate average heritability per bin (using REML h2cis)
-    matched_herit = all_herit.loc[all_herit['Gene'].isin(g_annot_final['Gene']), 'h2cis'].values
+    # Need to match the exact order of genes in g_annot_final
+    gene_order = g_annot_final['Gene'].tolist()
+    matched_herit = np.array([herit_dict[g] for g in gene_order])
     G = np.sum(g_annot, axis=0)
     ave_cis_herit = np.dot(matched_herit, g_annot) / G
     
