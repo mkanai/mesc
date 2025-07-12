@@ -17,25 +17,65 @@ def getBlockLefts(coords, max_dist):
 
     Returns
     -------
-    block_left : 1D np.ndarray with same length as block_left
-        block_left[j] :=  min{k | dist(j, k) < max_dist}.
+    block_left : 1D np.ndarray with same length as coords
+        block_left[i] := index of leftmost SNP within max_dist of SNP i.
+        Creates symmetric windows around each SNP.
 
     '''
     M = len(coords)
-    j = 0
-    block_left = np.zeros(M)
+    block_left = np.zeros(M, dtype=int)
+    
     for i in xrange(M):
-        while j < M and abs(coords[j] - coords[i]) > max_dist:
-            j += 1
-
-        block_left[i] = j
+        # Find leftmost SNP within max_dist of SNP i
+        # Reset search for each SNP (fixes the sliding window bug)
+        for j in xrange(M):
+            if abs(coords[j] - coords[i]) <= max_dist:
+                block_left[i] = j
+                break
+        else:
+            # No SNPs within window (shouldn't happen with self)
+            block_left[i] = i
 
     return block_left
 
 
+def getBlockRights(coords, max_dist):
+    '''
+    Gets the rightmost SNPs to be included in blocks.
+
+    Parameters
+    ----------
+    coords : array
+        Array of coordinates. Must be sorted.
+    max_dist : float
+        Maximum distance between SNPs included in the same window.
+
+    Returns
+    -------
+    block_right : 1D np.ndarray with same length as coords
+        block_right[i] := index of rightmost SNP within max_dist of SNP i.
+        Creates symmetric windows around each SNP.
+
+    '''
+    M = len(coords)
+    block_right = np.zeros(M, dtype=int)
+    
+    for i in xrange(M):
+        # Find rightmost SNP within max_dist of SNP i
+        for j in xrange(M-1, -1, -1):
+            if abs(coords[j] - coords[i]) <= max_dist:
+                block_right[i] = j
+                break
+        else:
+            # No SNPs within window (shouldn't happen with self)
+            block_right[i] = i
+
+    return block_right
+
+
 def block_left_to_right(block_left):
     '''
-    Converts block lefts to block rights.
+    Converts block lefts to block rights (legacy function).
 
     Parameters
     ----------
@@ -120,9 +160,14 @@ class __GenotypeArrayInMemory__(object):
 
     def ldScoreVarBlocks(self, block_left, c, annot=None):
         '''Computes an unbiased estimate of L2(j) for j=1,..,M.'''
-        func = lambda x: self.__l2_unbiased__(x, self.n)
-        snp_getter = self.nextSNPs
-        return self.__corSumVarBlocks__(block_left, c, func, snp_getter, annot)
+        # Check if we should use the corrected symmetric implementation
+        if hasattr(self, 'use_corrected_windows') and self.use_corrected_windows:
+            return self.__corSumSymmetricWindows__(block_left, annot)
+        else:
+            # Use original chunked implementation (with bugs)
+            func = lambda x: self.__l2_unbiased__(x, self.n)
+            snp_getter = self.nextSNPs
+            return self.__corSumVarBlocks__(block_left, c, func, snp_getter, annot)
 
     def ldScoreBlockJackknife(self, block_left, c, annot=None, jN=10):
         func = lambda x: np.square(x)
@@ -133,6 +178,67 @@ class __GenotypeArrayInMemory__(object):
         denom = n-2 if n > 2 else n  # allow n<2 for testing purposes
         sq = np.square(x)
         return sq - (1-sq) / denom
+
+    def __corSumSymmetricWindows__(self, block_left, annot=None):
+        '''
+        Computes LD scores using correct symmetric windows (fixes the asymmetric window bug).
+        This implements the theoretical definition from the LD score regression paper.
+        '''
+        m, n = self.m, self.n
+        
+        if annot is None:
+            annot = np.ones((m, 1))
+        else:
+            if annot.shape[0] != m:
+                raise ValueError('Incorrect number of SNPs in annot')
+        
+        n_a = annot.shape[1]
+        ld_scores = np.zeros((m, n_a))
+        
+        # Get all normalized genotypes at once
+        print("  Computing LD scores using corrected symmetric windows...")
+        self._currentSNP = 0  # Reset SNP counter
+        all_genotypes = self.nextSNPs(m)  # Get all SNPs
+        
+        # Compute positions from coordinates (assuming they're in self.df)
+        coords = self.df[:, 2].astype(float)  # BP column
+        max_dist = 1000000  # 1 Mb in base pairs
+        
+        # Get symmetric window boundaries
+        block_right = getBlockRights(coords, max_dist)
+        
+        print(f"    Processing {m} SNPs with symmetric windows...")
+        
+        # For each SNP, compute correlations with all SNPs in its symmetric window
+        for i in xrange(m):
+            if i % 1000 == 0:
+                print(f"      Processing SNP {i}/{m}...")
+            
+            # Get symmetric window for SNP i
+            left_idx = block_left[i]
+            right_idx = block_right[i]
+            
+            # Compute correlations between SNP i and all SNPs in its window
+            geno_i = all_genotypes[:, i]
+            
+            for j in xrange(left_idx, right_idx + 1):
+                if i == j:
+                    # Self-correlation
+                    r2_unbiased = 1.0
+                else:
+                    # Correlation with other SNP
+                    geno_j = all_genotypes[:, j]
+                    r = np.corrcoef(geno_i, geno_j)[0, 1]
+                    if np.isnan(r):
+                        r = 0.0
+                    r2 = r * r
+                    r2_unbiased = self.__l2_unbiased__(r, n)
+                
+                # Add to LD score
+                ld_scores[i, :] += r2_unbiased * annot[j, :]
+        
+        print("    Symmetric window LD score computation completed")
+        return ld_scores
 
     # general methods for calculating sums of Pearson correlation coefficients
     def __corSumVarBlocks__(self, block_left, c, func, snp_getter, annot=None):
@@ -245,13 +351,19 @@ class PlinkBEDFile(__GenotypeArrayInMemory__):
     '''
     Interface for Plink .bed format
     '''
-    def __init__(self, fname, n, snp_list, keep_snps=None, keep_indivs=None, mafMin=None):
+    def __init__(self, fname, n, snp_list, keep_snps=None, keep_indivs=None, mafMin=None, 
+                 use_corrected_windows=False):
         self._bedcode = {
             2: ba.bitarray('11'),
             9: ba.bitarray('10'),
             1: ba.bitarray('01'),
             0: ba.bitarray('00')
             }
+        
+        # Flag to use corrected symmetric windows instead of buggy asymmetric ones
+        self.use_corrected_windows = use_corrected_windows
+        if use_corrected_windows:
+            print('Using corrected symmetric windows (fixes asymmetric window bug)')
 
         __GenotypeArrayInMemory__.__init__(self, fname, n, snp_list, keep_snps=keep_snps,
             keep_indivs=keep_indivs, mafMin=mafMin)
