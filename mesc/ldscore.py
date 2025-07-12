@@ -207,12 +207,12 @@ class __GenotypeArrayInMemory__(object):
         # Get symmetric window boundaries
         block_right = getBlockRights(coords, max_dist)
         
-        print(f"    Processing {m} SNPs with symmetric windows...")
+        print("    Processing {} SNPs with symmetric windows...".format(m))
         
         # For each SNP, compute correlations with all SNPs in its symmetric window
         for i in xrange(m):
             if i % 1000 == 0:
-                print(f"      Processing SNP {i}/{m}...")
+                print("      Processing SNP {}/{}...".format(i, m))
             
             # Get symmetric window for SNP i
             left_idx = block_left[i]
