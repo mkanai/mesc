@@ -352,7 +352,7 @@ class PlinkBEDFile(__GenotypeArrayInMemory__):
     Interface for Plink .bed format
     '''
     def __init__(self, fname, n, snp_list, keep_snps=None, keep_indivs=None, mafMin=None, 
-                 use_corrected_windows=False):
+                 use_corrected_windows=True):
         self._bedcode = {
             2: ba.bitarray('11'),
             9: ba.bitarray('10'),
@@ -363,7 +363,10 @@ class PlinkBEDFile(__GenotypeArrayInMemory__):
         # Flag to use corrected symmetric windows instead of buggy asymmetric ones
         self.use_corrected_windows = use_corrected_windows
         if use_corrected_windows:
-            print('Using corrected symmetric windows (fixes asymmetric window bug)')
+            print('Using corrected symmetric windows (fixes asymmetric window bugs)')
+        else:
+            print('WARNING: Using original buggy asymmetric windows (use_corrected_windows=False)')
+            print('         This is not recommended. Set use_corrected_windows=True for theoretically correct LD scores.')
 
         __GenotypeArrayInMemory__.__init__(self, fname, n, snp_list, keep_snps=keep_snps,
             keep_indivs=keep_indivs, mafMin=mafMin)
