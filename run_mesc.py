@@ -146,7 +146,10 @@ parser.add_argument('--eqtl-sumstat', default=None, type=str,
                     help='eQTL summary statistic data.')
 parser.add_argument('--gene-sets', default=None, type=str,
                     help='File containing gene sets. One gene set per line. First column is gene set name, remaining '
-                         'columns are gene names.')
+                         'columns are gene names. With --compute-expscore-sumstat, gene sets may overlap and are '
+                         'analyzed on top of the overall h2cis bins. With --compute-expscore-indiv or '
+                         '--compute-expscore-from-lasso, gene sets must be disjoint and cover all genes, and genes '
+                         'are binned by h2cis within each gene set.')
 # Optional flags
 parser.add_argument('--columns', default=None, type=str,
                     help='List of indices separated by commas.')

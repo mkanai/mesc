@@ -44,6 +44,86 @@ def flatten_list(x):
     else:
         return [x]
 
+def read_gene_sets(fname):
+    '''
+    Read gene sets from file. One gene set per line. First column is the gene set name,
+    remaining columns are gene names.
+    '''
+    gsets = collections.OrderedDict()
+    with open(fname, 'r') as f:
+        for line in f:
+            line = line.strip().split()
+            if len(line) == 0:
+                continue
+            gsets[line[0]] = list(set(line[1:]))
+    return gsets
+
+def quantile_bins(values, n_bins):
+    '''
+    Assign values to n_bins equal-sized quantile bins by rank. Unlike pd.qcut this never
+    raises on ties or on fewer values than bins, which matters because bins are computed
+    per chromosome and every chromosome must emit the same set of categories.
+    '''
+    n = len(values)
+    ranks = np.empty(n, dtype=int)
+    ranks[np.argsort(values, kind='mergesort')] = np.arange(n)
+    return np.minimum((ranks * n_bins) // max(n, 1), n_bins - 1)
+
+def assign_gene_annot(args, gene_names, gene_herits):
+    '''
+    Build the gene annotation matrix (n_genes x n_categories).
+
+    All genes are binned into args.num_bins quantile bins of h2cis, giving the baseline
+    Cis_herit_bin_{i} categories that MESC's --h2med step always expects. With
+    --gene-sets, each gene set adds args.num_gene_bins further categories,
+    {gene set}_Cis_herit_bin_{j}, over the genes in that set only. A gene in a gene set
+    therefore belongs to two categories, a baseline bin and a gene set bin, and the
+    annotation matrix is overlapping (cf. mesc/expscore_sumstat.py, which builds the same
+    categories from summary statistics). --h2med analyzes each gene set jointly with the
+    baseline bins via the gene overlap matrix and reports h2med for the set.
+
+    Gene sets need not be disjoint and need not cover every gene.
+
+    Returns the annotation matrix and the list of category names.
+    '''
+    gene_herits = np.array(gene_herits)
+    n_genes = len(gene_names)
+
+    bin_names = ['Cis_herit_bin_{}'.format(i) for i in range(1, args.num_bins + 1)]
+    gene_bins = pd.qcut(gene_herits, args.num_bins, labels=range(args.num_bins)).astype(int)
+
+    g_annot = np.zeros((n_genes, args.num_bins), dtype=int)
+    g_annot[np.arange(n_genes), gene_bins] = 1
+
+    if args.gene_sets is not None:
+        gsets = read_gene_sets(args.gene_sets)
+        gene_index = dict(zip(gene_names, range(n_genes)))
+
+        for gset_name, gset_genes in gsets.items():
+            idx = np.array(sorted(gene_index[x] for x in set(gset_genes) if x in gene_index))
+            if len(idx) == 0:
+                raise ValueError('Gene set {} contains no genes present in the expression '
+                                 'matrix'.format(gset_name))
+
+            gset_annot = np.zeros((n_genes, args.num_gene_bins), dtype=int)
+            gset_bins = quantile_bins(gene_herits[idx], args.num_gene_bins)
+            gset_annot[idx, gset_bins] = 1
+
+            g_annot = np.c_[g_annot, gset_annot]
+            bin_names += ['{}_Cis_herit_bin_{}'.format(gset_name, j)
+                          for j in range(1, args.num_gene_bins + 1)]
+            print('Gene set {}: {} of {} genes, binned into {} h2cis bins'.format(
+                gset_name, len(idx), n_genes, args.num_gene_bins))
+
+    return g_annot, bin_names
+
+def match_h2cis(all_herit, gene_names):
+    '''
+    Return h2cis of each gene in gene_names, in that order.
+    '''
+    herit_of_gene = dict(zip(all_herit['Gene'].tolist(), all_herit['h2cis'].tolist()))
+    return np.array([herit_of_gene[x] for x in gene_names])
+
 def file_len(fname, input_chr, chr_idx):
     '''
     Get number of genes in gene expression file on input chromosome
@@ -321,23 +401,24 @@ def get_expression_scores(args):
         all_lasso_temp = [x for x in all_lasso if not np.isnan(x[1])]
         all_lasso_temp = [x for x in all_lasso_temp if x[1] > 0]
 
+        gene_names = [x[0] for x in all_lasso_temp]
         lasso_herits = [x[1] for x in all_lasso_temp]
-        g_annot = np.zeros((len(all_lasso_temp), args.num_bins), dtype=int)
-        eqtl_annot = np.zeros((len(geno_array.df), args.num_bins))
-        gene_bins = pd.qcut(np.array(lasso_herits), args.num_bins, labels=range(args.num_bins)).astype(int)
-        g_bin_names = ['Cis_herit_bin_{}'.format(x) for x in range(1, args.num_bins+1)]
+        g_annot, g_bin_names = assign_gene_annot(args, gene_names, lasso_herits)
+        eqtl_annot = np.zeros((len(geno_array.df), len(g_bin_names)))
         for j in range(0, len(all_lasso_temp)):
-            g_annot[j, gene_bins[j]] = 1
             snp_idx = [snp_indices[x] for x in all_lasso_temp[j][2]['SNP'].tolist()]
-            eqtl_annot[snp_idx, gene_bins[j]] += np.square(all_lasso_temp[j][2]['CORR_EFFECT'].values)
+            eqtl_effect = np.square(all_lasso_temp[j][2]['CORR_EFFECT'].values)
+            # a gene belongs to a baseline bin and, if it is in a gene set, a gene set bin
+            for gene_bin in np.nonzero(g_annot[j])[0]:
+                eqtl_annot[snp_idx, gene_bin] += eqtl_effect
 
-        g_annot_final = pd.DataFrame(np.c_[[x[0] for x in all_lasso_temp], g_annot])
+        g_annot_final = pd.DataFrame(np.c_[gene_names, g_annot])
         g_annot_final.columns = ['Gene'] + g_bin_names
         g_annot_final.to_csv('{}.{}.gannot.gz'.format(args.out, args.chr), sep='\t', index=False, compression='gzip')
 
-        matched_herit = all_herit.loc[all_herit['Gene'].isin(g_annot_final['Gene']), 'h2cis'].values
+        matched_herit = match_h2cis(all_herit, gene_names)
         G = np.sum(g_annot, axis=0)
-        ave_cis_herit = np.dot(matched_herit, g_annot) / G
+        ave_cis_herit = np.dot(matched_herit, g_annot) / np.maximum(G, 1)
 
         np.savetxt('{}.{}.G'.format(args.out, args.chr), G.reshape((1, len(G))), fmt='%d')
         np.savetxt('{}.{}.ave_h2cis'.format(args.out, args.chr), ave_cis_herit.reshape((1, len(ave_cis_herit))),
@@ -488,31 +569,30 @@ def compute_expression_scores_from_lasso(args):
         raise ValueError('No genes with positive heritability found')
     
     # Extract LASSO heritabilities for binning (use h2cis from REML, not empirical)
+    gene_names = [x[0] for x in all_lasso_temp]
     lasso_herits = [x[1] for x in all_lasso_temp]
-    
-    # Create gene annotation and eQTL annotation matrices
-    g_annot = np.zeros((len(all_lasso_temp), args.num_bins), dtype=int)
-    eqtl_annot = np.zeros((len(geno_array.df), args.num_bins))
-    
-    # Bin genes by REML h2cis
-    gene_bins = pd.qcut(np.array(lasso_herits), args.num_bins, labels=range(args.num_bins)).astype(int)
-    g_bin_names = ['Cis_herit_bin_{}'.format(x) for x in range(1, args.num_bins+1)]
-    
-    # Fill annotation matrices
+
+    # Bin genes by REML h2cis, adding gene set bins if --gene-sets is specified
+    g_annot, g_bin_names = assign_gene_annot(args, gene_names, lasso_herits)
+
+    # Create eQTL annotation matrix
+    eqtl_annot = np.zeros((len(geno_array.df), len(g_bin_names)))
+
+    # Fill annotation matrix
     for j in range(len(all_lasso_temp)):
         gene, h2cis, gene_lasso = all_lasso_temp[j]
-        
-        # Gene annotation
-        g_annot[j, gene_bins[j]] = 1
-        
+
         # eQTL annotation - use CORR_EFFECT squared
         # Note: This assumes all SNPs in LASSO output exist in the genotype file
         # which should be true since LASSO was run with --extract keep_snps
         snp_idx = [snp_indices[x] for x in gene_lasso['SNP'].tolist()]
-        eqtl_annot[snp_idx, gene_bins[j]] += np.square(gene_lasso['CORR_EFFECT'].values)
+        eqtl_effect = np.square(gene_lasso['CORR_EFFECT'].values)
+        # a gene belongs to a baseline bin and, if it is in a gene set, a gene set bin
+        for gene_bin in np.nonzero(g_annot[j])[0]:
+            eqtl_annot[snp_idx, gene_bin] += eqtl_effect
     
     # Create gene annotation output
-    g_annot_final = pd.DataFrame(np.c_[[x[0] for x in all_lasso_temp], g_annot])
+    g_annot_final = pd.DataFrame(np.c_[gene_names, g_annot])
     g_annot_final.columns = ['Gene'] + g_bin_names
     g_annot_final.to_csv('{}.{}.gannot.gz'.format(args.out, args.chr), sep='\t', index=False, compression='gzip')
     print('Saved gene annotations to {}.{}.gannot.gz'.format(args.out, args.chr))
@@ -522,7 +602,7 @@ def compute_expression_scores_from_lasso(args):
     gene_order = g_annot_final['Gene'].tolist()
     matched_herit = np.array([herit_dict[g] for g in gene_order])
     G = np.sum(g_annot, axis=0)
-    ave_cis_herit = np.dot(matched_herit, g_annot) / G
+    ave_cis_herit = np.dot(matched_herit, g_annot) / np.maximum(G, 1)
     
     # Save gene counts and average heritabilities
     np.savetxt('{}.{}.G'.format(args.out, args.chr), G.reshape((1, len(G))), fmt='%d')
